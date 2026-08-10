@@ -11,4 +11,4 @@ distributor           = cliii_one
 distributor_url       = https://github.com/cliii-one    
 desktop_uidir         = ui
 desktop_applaunchname = flymail.APPLICATION
-changelog             = 1. 前端细节优化
+changelog             = 1. 前端细节优化 2.修复手机端联系人检索问题
