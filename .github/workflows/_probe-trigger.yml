@@ -2,6 +2,7 @@ name: probe
 on:
   push:
     branches: [main]
+    tags: ['probe-*']
 jobs:
   ping:
     runs-on: ubuntu-latest
