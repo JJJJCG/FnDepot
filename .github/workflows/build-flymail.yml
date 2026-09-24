@@ -1,3 +1,17 @@
+# 飞牛 fnOS 应用打包流水线（x86_64 单架构）
+#
+# 放置位置：FnDepot 仓库
+#   <FnDepot>/.github/workflows/build-flymail.yml   ← 本文件
+#   <FnDepot>/flymail/                              ← 飞牛应用工程
+#       manifest / ICON.PNG / ICON_256.PNG / wizard/
+#       config/privilege / config/resource / cmd/*   ← 这些静态件在 FnDepot，不在源码仓库
+#       app/ui/         ← 由本流水线写入（前端产物）
+#       app/server/     ← 由本流水线写入（Nuitka 二进制 + notify-assets）
+#
+# FlyMail 源码仓库根目录保留一份同名模板用于手动复制（.gitignore 已排除，不入库）。
+#
+# 触发：推送 tag flymail-v* 或手动 workflow_dispatch。
+
 name: 构建 FlyMail
 
 on:
@@ -6,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（留空则读取 manifest 默认版本）'
+        description: '版本号（留空则读取 flymail/manifest 中的版本）'
         required: false
         default: ''
       create_release:
@@ -16,94 +30,153 @@ on:
         type: choice
         options: ['true', 'false']
       update_fnpack:
-        description: '更新 fnpack.json 版本信息'
+        description: '更新 fnpack.json 版本信息（需 FnDepot 中存在该脚本）'
         required: false
         default: 'false'
         type: choice
         options: ['true', 'false']
 
+permissions:
+  contents: write
+
+concurrency:
+  group: build-flymail-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 飞牛官方当前版本（1.2.2 未发布；1.2.3 的 ARM 包在下载源里叫
+  # fnpack-1.2.3-linux-arm ——与官方文档写的 -linux-arm64 不一致，将来加 ARM 时注意）
+  FNPACK_VERSION: '1.2.3'
+  # 编译镜像用 bookworm（glibc 2.36），比 ubuntu-24.04（glibc 2.39）更旧：
+  # Nuitka 产物动态链接宿主 glibc，用旧底编译才能保证低版本 fnOS 也起得来
+  PYTHON_BUILD_IMAGE: 'python:3.11-slim-bookworm'
+  NODE_VERSION: '24'
+
 jobs:
   build:
-    runs-on: ${{ matrix.runner }}
-    name: 构建 ${{ matrix.arch }}
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            fnpack_platform: x86
-            runner: ubuntu-latest
-          - arch: arm64
-            fnpack_platform: arm
-            runner: ubuntu-24.04-arm
+    name: 构建 x86_64 FPK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: flymail
+        shell: bash
 
     steps:
-      # ========== 检出 FnDepot 仓库 ==========
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - name: 检出 FnDepot
+        uses: actions/checkout@v7
 
-      # ========== 确定版本号 ==========
+      # 工具链校验放最前面：下载源挂了要在十几秒内失败，而不是等 Nuitka 编译完
+      - name: 下载并校验 fnpack
+        run: |
+          set -euo pipefail
+          url="https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          echo "下载 $url"
+          curl -fsSL -o /tmp/fnpack "$url"
+          # 校验是真 ELF 而不是 CDN 返回的错误页
+          head -c 4 /tmp/fnpack | od -An -tx1 | tr -d ' \n' | grep -qi '^7f454c46$' \
+            || { echo "::error::fnpack 不是 ELF 二进制，下载源可能返回了错误页"; exit 1; }
+          size=$(stat -c%s /tmp/fnpack)
+          [ "$size" -gt 1000000 ] || { echo "::error::fnpack 体积异常: $size 字节"; exit 1; }
+          chmod +x /tmp/fnpack
+          # 1.2.3-linux-amd64 实测 sha256（如需固定校验可启用）：
+          # 54b97fa7b70968c4d05c79840f5daeff508957d0bb2062fdb0376d00d9615c93
+          echo "fnpack 就绪，$size 字节"
+
+      - name: 校验应用工程必需文件
+        run: |
+          set -euo pipefail
+          # 只校验「必须人工维护、无法由流水线生成」的静态件
+          # app/ 由后面的组装步骤创建，不在此处校验，避免误报
+          missing=0
+          for p in manifest config/privilege config/resource ICON.PNG ICON_256.PNG cmd wizard; do
+            if [ ! -e "$p" ]; then
+              echo "::error::缺少必需项 flymail/$p（见 fnpack 打包检查表）"
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ] || exit 1
+
+          # config/privilege 与 config/resource 必须是合法 JSON
+          # 用 utf-8-sig 读，容忍模板自带的 BOM
+          python3 - <<'PY' || { echo "::error::config/privilege 或 config/resource 不是合法 JSON"; exit 1; }
+          import json
+          for p in ("config/privilege", "config/resource"):
+              with open(p, encoding="utf-8-sig") as f:
+                  json.load(f)
+          PY
+          echo "应用工程检查通过"
+
       - name: 确定版本号
         id: version
         run: |
-          MANIFEST_VER=$(grep '^version' manifest | awk -F'=' '{print $2}' | tr -d ' ')
+          set -euo pipefail
+          MANIFEST_VER=$(grep -E '^version[[:space:]]*=' manifest | head -1 | cut -d= -f2- | tr -d ' \r')
           if [ -n "${{ github.event.inputs.version }}" ]; then
             VERSION="${{ github.event.inputs.version }}"
-          elif [[ "${{ github.ref }}" == refs/tags/flymail-v* ]]; then
-            VERSION="${{ github.ref_name }}"
-            VERSION="${VERSION#flymail-v}"
+          elif [[ "${GITHUB_REF:-}" == refs/tags/flymail-v* ]]; then
+            VERSION="${GITHUB_REF_NAME#flymail-v}"
           else
-            VERSION="${MANIFEST_VER}"
+            VERSION="$MANIFEST_VER"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          [ -n "$VERSION" ] || { echo "::error::无法确定版本号"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "版本号: $VERSION"
 
-      # ========== 克隆私有仓库源码 ==========
       - name: 克隆源码仓库
         env:
+          # 源码仓库：fork 场景填自己的仓库（公开仓库无需 secret）
+          SRC_REPO: JJJJCG/FlyMailF
           PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
-          git clone --depth=1 -b main https://x-access-token:${PRIVATE_TOKEN}@github.com/DinDing1/FlyMail.git /tmp/flymail-src
-          echo "✅ 源码克隆完成"
+          set -euo pipefail
+          rm -rf /tmp/flymail-src
+          if [ -n "${PRIVATE_TOKEN:-}" ]; then
+            # 私有仓库：用 token 克隆
+            git clone --depth=1 -b main \
+              "https://x-access-token:${PRIVATE_TOKEN}@github.com/${SRC_REPO}.git" \
+              /tmp/flymail-src
+          else
+            # 公开仓库：匿名克隆，无需配置 secret
+            git clone --depth=1 -b main \
+              "https://github.com/${SRC_REPO}.git" \
+              /tmp/flymail-src
+          fi
+          test -f /tmp/flymail-src/VERSION || { echo "::error::源码克隆结果异常，缺少 VERSION"; exit 1; }
+          echo "源码克隆完成：$(cat /tmp/flymail-src/VERSION)"
 
-      # ========== 构建前端 ==========
-      - name: 配置 Node.js 环境
-        uses: actions/setup-node@v4
+      - name: 配置 Node.js
+        uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: 构建前端
         run: |
+          set -euo pipefail
           cd /tmp/flymail-src/frontend
-          npm install
+          # package-lock.json 未入库（.gitignore 排除），只能用 install
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
           npm run build
-          echo "✅ 前端构建完成"
+          [ -f /tmp/flymail-src/dist/ui/index.html ] || { echo "::error::前端产物缺少 index.html"; exit 1; }
+          echo "前端构建完成"
 
-      # ========== 编译后端 (Nuitka) ==========
-      - name: 编译 Python 后端 (Nuitka)
+      - name: 编译后端（Nuitka onefile）
         run: |
-          mkdir -p /tmp/nuitka-out
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            echo "ARM 构建：在 ubuntu-24.04-arm 原生 runner 上编译..."
-            PLATFORM="linux/arm64"
-          else
-            echo "x86_64 构建：在 ubuntu-latest 上编译..."
-            PLATFORM="linux/amd64"
-          fi
-          
-          docker run --rm --platform $PLATFORM \
+          set -euo pipefail
+          rm -rf /tmp/nuitka-out && mkdir -p /tmp/nuitka-out
+          docker run --rm --platform linux/amd64 \
             -v /tmp/flymail-src/backend:/build \
             -v /tmp/nuitka-out:/output \
-            python:3.11-slim-bookworm \
+            "$PYTHON_BUILD_IMAGE" \
             bash -c "
+              set -e
               apt-get update -qq && apt-get install -y -qq patchelf gcc > /dev/null &&
               pip install 'nuitka[onefile]' ordered-set websockets --quiet &&
               pip install -r /build/requirements.txt --quiet &&
               cd /build &&
               python -m nuitka --standalone --onefile \
                 --lto=no \
+                --assume-yes-for-downloads \
                 --include-package=db \
                 --include-package=models \
                 --include-package=providers \
@@ -144,6 +217,7 @@ jobs:
                 --include-module=websockets.legacy.protocol \
                 --include-module=websockets.server \
                 --include-module=websockets.connection \
+                --include-module=websockets.http \
                 --include-module=websockets.http11 \
                 --include-module=websockets.uri \
                 --include-module=websockets.typing \
@@ -170,120 +244,140 @@ jobs:
                 --include-module=multipart \
                 --output-filename=flymail-server \
                 --output-dir=/output \
-                main.py &&
-              echo '编译完成'
+                main.py
             "
-          echo "✅ Python 后端编译完成"
-          file /tmp/nuitka-out/flymail-server 2>/dev/null || true
+          [ -x /tmp/nuitka-out/flymail-server ] || { echo "::error::Nuitka 未产出 flymail-server"; exit 1; }
+          file /tmp/nuitka-out/flymail-server
           ls -lh /tmp/nuitka-out/flymail-server
 
-      # ========== 组装应用文件 ==========
       - name: 组装应用文件
         run: |
-          # 清理旧的前端文件
-          rm -rf app/ui/assets app/ui/guide app/ui/*.html app/ui/*.js app/ui/*.css app/ui/*.svg app/ui/*.png
-          # 复制新的前端产物
+          set -euo pipefail
+          # 清理上一次构建残留的前端
+          rm -rf app/ui/assets app/ui/guide
+          rm -f app/ui/*.html app/ui/*.js app/ui/*.css app/ui/*.svg app/ui/*.png app/ui/manifest.webmanifest
           mkdir -p app/ui
-          cp -r /tmp/flymail-src/dist/ui/* app/ui/
+          cp -r /tmp/flymail-src/dist/ui/. app/ui/
 
-          # 清理旧的后端文件
+          # 清理残留的后端源码/依赖（若曾被误提交）
           rm -rf app/server/db app/server/models app/server/providers app/server/services
           rm -f app/server/main.py app/server/dev.py app/server/version.py app/server/requirements.txt
           rm -rf app/server/wheels app/server/__pycache__ app/server/ui
-          # 复制新的后端二进制
           mkdir -p app/server
           cp /tmp/nuitka-out/flymail-server app/server/flymail-server
           chmod +x app/server/flymail-server
-          # 通知图片模式：字体+LOGO 仅旁路一份 notify-assets（不 Nuitka 内嵌，避免 FPK 双份 ~16MB）
+
+          # 通知图片模式的字体 + LOGO 走旁路单份（不嵌进 Nuitka，否则 FPK 里双份约 16MB）
           rm -rf app/server/notify-assets
           mkdir -p app/server/notify-assets
           FONT_SRC="/tmp/flymail-src/backend/services/notify/assets/SourceHanSansSC-Regular.otf"
           ICON_SRC="/tmp/flymail-src/backend/services/notify/assets/icon.png"
-          test -f "$FONT_SRC" || { echo "ERROR: missing notify font: $FONT_SRC"; exit 1; }
-          test -f "$ICON_SRC" || { echo "ERROR: missing notify icon: $ICON_SRC"; exit 1; }
+          [ -s "$FONT_SRC" ] || { echo "::error::缺少通知字体: $FONT_SRC"; exit 1; }
+          [ -s "$ICON_SRC" ] || { echo "::error::缺少通知图标: $ICON_SRC"; exit 1; }
           cp -f "$FONT_SRC" app/server/notify-assets/SourceHanSansSC-Regular.otf
           cp -f "$ICON_SRC" app/server/notify-assets/icon.png
+          [ -s app/server/notify-assets/SourceHanSansSC-Regular.otf ] || { echo "::error::字体复制为空"; exit 1; }
           ls -la app/server/notify-assets/
-          test -s app/server/notify-assets/SourceHanSansSC-Regular.otf || { echo "ERROR: font copy empty"; exit 1; }
-          echo "✅ 应用文件组装完成"
+          echo "应用文件组装完成"
 
-      # ========== 更新 manifest ==========
       - name: 更新 manifest
         run: |
+          set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
-          PLATFORM="${{ matrix.fnpack_platform }}"
-          sed -i "s/^version.*/version=${VERSION}/" manifest
-          sed -i "s/^platform.*/platform=${PLATFORM}/" manifest
-
-      # ========== 修复脚本权限 ==========
-      - name: 修复脚本权限
-        run: |
-          for f in cmd/main cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback; do
-            [ -f "$f" ] && sed -i 's/\r$//' "$f" && chmod +x "$f"
-          done
-
-      # ========== 使用 fnpack 打包 FPK ==========
-      - name: 下载 fnpack 并打包
-        run: |
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            curl -fsSL -o /tmp/fnpack https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-arm64
+          if grep -qE '^version[[:space:]]*=' manifest; then
+            sed -i -E "s|^version[[:space:]]*=.*|version=${VERSION}|" manifest
           else
-            curl -fsSL -o /tmp/fnpack https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-amd64
+            echo "version=${VERSION}" >> manifest
           fi
-          chmod +x /tmp/fnpack
-          /tmp/fnpack build --directory .
-          FPKN=$(ls *.fpk) && mv "$FPKN" flymail-${{ matrix.arch == 'x86_64' && 'X86' || 'ARM' }}.fpk
-          echo "✅ 构建完成: $(ls -lh *.fpk)"
+          if grep -qE '^platform[[:space:]]*=' manifest; then
+            sed -i -E "s|^platform[[:space:]]*=.*|platform=x86|" manifest
+          else
+            echo "platform=x86" >> manifest
+          fi
+          grep -E '^(appname|version|platform|display_name)=' manifest
 
-      # ========== 上传产物 ==========
-      - name: 上传 FPK
-        uses: actions/upload-artifact@v4
+      - name: 修复脚本权限与换行
+        run: |
+          set -euo pipefail
+          for f in main install_init install_callback uninstall_init uninstall_callback \
+                   upgrade_init upgrade_callback config_init config_callback; do
+            [ -f "cmd/$f" ] || continue
+            sed -i 's/\r$//' "cmd/$f"
+            chmod +x "cmd/$f"
+          done
+          ls -l cmd/
+
+      - name: 打包 FPK
+        run: |
+          set -euo pipefail
+          # manifest 声明了 desktop_uidir 时该目录必须存在（组装完成后才校验）
+          uidir=$(grep -E '^desktop_uidir[[:space:]]*=' manifest | head -1 | cut -d= -f2- | tr -d ' \r')
+          if [ -n "$uidir" ] && [ ! -d "app/$uidir" ]; then
+            echo "::error::manifest 声明 desktop_uidir=$uidir，但 flymail/app/$uidir 不存在"
+            exit 1
+          fi
+
+          /tmp/fnpack build --directory .
+          mapfile -t fpks < <(ls -1 ./*.fpk 2>/dev/null || true)
+          if [ "${#fpks[@]}" -ne 1 ]; then
+            echo "::error::期望产出 1 个 .fpk，实际 ${#fpks[@]} 个：${fpks[*]:-无}"
+            exit 1
+          fi
+          mv "${fpks[0]}" flymail-X86.fpk
+          [ -s flymail-X86.fpk ] || { echo "::error::flymail-X86.fpk 为空"; exit 1; }
+          ls -lh flymail-X86.fpk
+          sha256sum flymail-X86.fpk | tee flymail-X86.fpk.sha256
+          file flymail-X86.fpk
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
         with:
-          name: flymail-${{ matrix.arch }}
-          path: flymail/flymail-*.fpk
+          name: flymail-x86_64
+          path: flymail/flymail-X86.fpk
+          if-no-files-found: error
           retention-days: 30
 
   release:
+    name: 发布 Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/flymail-v') || github.event.inputs.create_release == 'true'
-    permissions:
-      contents: write
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - name: 检出 FnDepot
+        uses: actions/checkout@v7
 
-      - name: 下载所有 FPK
-        uses: actions/download-artifact@v4
+      - name: 下载 FPK
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts/
 
-      - name: 删除旧版本 Release
+      - name: 清理旧 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null || echo "")
-          echo "$RELEASES" | while read -r tag; do
-            case "$tag" in flymail-*) gh release delete "${tag}" --yes --cleanup-tag 2>/dev/null || true;; esac
+          set -euo pipefail
+          gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null | while read -r tag; do
+            case "$tag" in flymail-*) gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true;; esac
           done
 
       - name: 确定构建信息
         id: info
         run: |
-          MANIFEST_VER=$(grep '^version' flymail/manifest | awk -F'=' '{print $2}' | tr -d ' ')
-          if [[ "${{ github.ref }}" == refs/tags/flymail-v* ]]; then
-            TAG="${{ github.ref_name }}" && VERSION="${TAG#flymail-v}"
+          set -euo pipefail
+          MANIFEST_VER=$(grep -E '^version[[:space:]]*=' flymail/manifest | head -1 | cut -d= -f2- | tr -d ' \r')
+          if [[ "${GITHUB_REF:-}" == refs/tags/flymail-v* ]]; then
+            VERSION="${GITHUB_REF_NAME#flymail-v}" && TAG="${GITHUB_REF_NAME}"
           elif [ -n "${{ github.event.inputs.version }}" ]; then
-            TAG="flymail-v${{ github.event.inputs.version }}" && VERSION="${{ github.event.inputs.version }}"
+            VERSION="${{ github.event.inputs.version }}" && TAG="flymail-v${VERSION}"
           else
-            TAG="flymail-v${MANIFEST_VER}" && VERSION="${MANIFEST_VER}"
+            VERSION="$MANIFEST_VER" && TAG="flymail-v${MANIFEST_VER}"
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "build_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M CST')" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M CST')" >> "$GITHUB_OUTPUT"
 
       - name: 创建 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.info.outputs.tag }}
           name: "飞邮 FlyMail ${{ steps.info.outputs.version }}"
@@ -294,26 +388,32 @@ jobs:
 
             专为多邮箱用户打造的自托管邮件客户端，统一管理 Gmail、Outlook、QQ邮箱、网易邮箱、iCloud 等主流邮箱平台。
 
-            ### 📦 下载
+            ### 下载
 
             | 文件 | 架构 | 适用设备 |
             |------|------|----------|
-            | `flymail-X86.fpk` | x86_64 | Intel/AMD NAS |
-            | `flymail-ARM.fpk` | arm64 | ARM NAS |
+            | `flymail-X86.fpk` | x86_64 | Intel / AMD NAS |
 
-            ### ✨ 功能特性
+            ### 安装
 
-            - 📬 多账号管理、聚合收件箱
-            - ✉️ 邮件收发、富文本编辑
-            - 📎 附件上传下载、定时发送
-            - 📝 邮件草稿、个性签名
-            - 🔄 实时同步、全平台支持
+            飞牛 OS → 应用中心 → 右上角手动安装 → 选择 `.fpk`。
+
+            ### 功能特性
+
+            - 多账号管理、聚合收件箱
+            - 邮件收发、富文本编辑
+            - 附件上传下载、定时发送
+            - 邮件草稿、个性签名
+            - 实时同步（IMAP IDLE / 轮询）
+            - 第三方通知：Bark / Telegram / 微信 / Webhook
 
             ---
             构建时间：${{ steps.info.outputs.build_time }}
 
       - name: 更新 README 编译时间
         run: |
+          set -euo pipefail
+          [ -f scripts/update-readme-time.py ] || { echo "跳过：FnDepot 中没有 scripts/update-readme-time.py"; exit 0; }
           git fetch origin main
           git checkout -B main origin/main
           python3 scripts/update-readme-time.py flymail "${{ steps.info.outputs.build_time }}"
@@ -327,6 +427,8 @@ jobs:
       - name: 更新 fnpack.json 版本信息
         if: github.event.inputs.update_fnpack == 'true'
         run: |
+          set -euo pipefail
+          [ -f scripts/update-fnpack.py ] || { echo "::error::FnDepot 中没有 scripts/update-fnpack.py"; exit 1; }
           git fetch origin main
           git checkout -B main origin/main
           python3 scripts/update-fnpack.py flymail "${{ steps.info.outputs.tag }}" "${{ github.repository }}"
