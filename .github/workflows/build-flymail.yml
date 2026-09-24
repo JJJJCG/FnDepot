@@ -10,7 +10,14 @@
 #
 # FlyMail 源码仓库根目录保留一份同名模板用于手动复制（.gitignore 已排除，不入库）。
 #
-# 触发：推送 tag flymail-v* 或手动 workflow_dispatch。
+# 触发方式：手动运行（workflow_dispatch），version 填目标版本号，例如
+#   gh workflow run build-flymail.yml --repo <owner>/FnDepot \
+#     -f version=1.0.9 -f create_release=true
+#
+# 注意：flymail-vX.Y.Z 这个 tag 是「发布步骤用 GITHUB_TOKEN 创建」的产物，
+# 不是触发入口 —— GitHub 规定 GITHUB_TOKEN 产生的事件不会再触发工作流
+# （防止递归），所以下面的 on.push.tags 实际不会自动跑；
+# 上游 FnDepot 的历史运行也 100% 是 workflow_dispatch。保留该触发器仅为兼容手推 tag。
 
 name: 构建 FlyMail
 
