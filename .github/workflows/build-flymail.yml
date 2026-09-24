@@ -163,6 +163,10 @@ jobs:
       - name: 编译后端（Nuitka onefile）
         run: |
           set -euo pipefail
+          # 依赖清单用「整包 include」而不是逐个 --include-module：
+          # 逐个列举会与服务端库版本强耦合——例如 websockets 新版已移除
+          # websockets.http，旧清单会让 Nuitka 直接 FATAL 退出。
+          # 整包 include 由 Nuitka 自行展开子模块，对版本变化免疫。
           rm -rf /tmp/nuitka-out && mkdir -p /tmp/nuitka-out
           docker run --rm --platform linux/amd64 \
             -v /tmp/flymail-src/backend:/build \
@@ -182,66 +186,18 @@ jobs:
                 --include-package=providers \
                 --include-package=services \
                 --include-package=PIL \
-                --include-module=PIL.Image \
-                --include-module=PIL.ImageDraw \
-                --include-module=PIL.ImageFont \
-                --include-module=PIL.ImageFilter \
-                --include-module=aiosqlite \
-                --include-module=aioimaplib \
-                --include-module=uvicorn \
-                --include-module=uvicorn.lifespan.on \
-                --include-module=uvicorn.lifespan.off \
-                --include-module=uvicorn.protocols.websockets.auto \
-                --include-module=uvicorn.protocols.websockets.wsproto_impl \
-                --include-module=uvicorn.protocols.websockets.websockets_impl \
-                --include-module=uvicorn.protocols.http.auto \
-                --include-module=uvicorn.protocols.http.h11_impl \
-                --include-module=uvicorn.protocols.http.httptools_impl \
-                --include-module=uvicorn.logging \
-                --include-module=uvicorn.loops \
-                --include-module=uvicorn.loops.auto \
-                --include-module=uvicorn.loops.asyncio \
+                --include-package=aiosqlite \
+                --include-package=aioimaplib \
+                --include-package=uvicorn \
+                --include-package=websockets \
+                --include-package=httpx \
+                --include-package=fastapi \
+                --include-package=starlette \
+                --include-package=apscheduler \
+                --include-package=sqlalchemy \
+                --include-package=multipart \
                 --include-module=email.mime.text \
                 --include-module=email.mime.multipart \
-                --include-module=httpx \
-                --include-module=fastapi \
-                --include-module=starlette \
-                --include-module=starlette.middleware \
-                --include-module=starlette.routing \
-                --include-module=starlette.requests \
-                --include-module=starlette.responses \
-                --include-module=starlette.websockets \
-                --include-module=websockets \
-                --include-module=websockets.legacy \
-                --include-module=websockets.legacy.server \
-                --include-module=websockets.legacy.protocol \
-                --include-module=websockets.server \
-                --include-module=websockets.connection \
-                --include-module=websockets.http \
-                --include-module=websockets.http11 \
-                --include-module=websockets.uri \
-                --include-module=websockets.typing \
-                --include-module=websockets.exceptions \
-                --include-module=websockets.utils \
-                --include-module=apscheduler \
-                --include-module=apscheduler.schedulers \
-                --include-module=apscheduler.schedulers.base \
-                --include-module=apscheduler.schedulers.asyncio \
-                --include-module=apscheduler.jobstores \
-                --include-module=apscheduler.jobstores.base \
-                --include-module=apscheduler.jobstores.sqlalchemy \
-                --include-module=apscheduler.triggers \
-                --include-module=apscheduler.triggers.date \
-                --include-module=apscheduler.executors \
-                --include-module=apscheduler.executors.base \
-                --include-module=apscheduler.executors.pool \
-                --include-module=sqlalchemy \
-                --include-module=sqlalchemy.engine \
-                --include-module=sqlalchemy.pool \
-                --include-module=sqlalchemy.orm \
-                --include-module=sqlalchemy.sql \
-                --include-module=sqlalchemy.event \
-                --include-module=multipart \
                 --output-filename=flymail-server \
                 --output-dir=/output \
                 main.py
@@ -249,6 +205,55 @@ jobs:
           [ -x /tmp/nuitka-out/flymail-server ] || { echo "::error::Nuitka 未产出 flymail-server"; exit 1; }
           file /tmp/nuitka-out/flymail-server
           ls -lh /tmp/nuitka-out/flymail-server
+
+      # 编译成功 ≠ 能跑：Nuitka 对动态 import 的漏打包要到运行时才暴露。
+      # 这里直接在 runner 上启动产物并打一次健康检查（产物按旧 glibc 编译，
+      # 在更新的 runner glibc 上运行是安全的）。
+      - name: 产物冒烟测试
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/smoke
+          SOCKET_PATH=/tmp/smoke/flymail.sock \
+          FLYMAIL_DATA_DIR=/tmp/smoke \
+          OAUTH_PORT=51010 \
+            /tmp/nuitka-out/flymail-server > /tmp/smoke/app.log 2>&1 &
+          APP_PID=$!
+
+          ready=0
+          for _ in $(seq 1 40); do
+            if [ -S /tmp/smoke/flymail.sock ]; then ready=1; break; fi
+            kill -0 "$APP_PID" 2>/dev/null || break
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::产物未能启动并创建 Unix Socket"
+            tail -60 /tmp/smoke/app.log || true
+            kill "$APP_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import socket
+          s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          s.connect("/tmp/smoke/flymail.sock")
+          s.sendall(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+          data = b""
+          while True:
+              chunk = s.recv(4096)
+              if not chunk:
+                  break
+              data += chunk
+          body = data.split(b"\r\n\r\n", 1)[-1].decode("utf-8", "replace")
+          compact = body.replace(" ", "")
+          assert '"flymail"' in compact, f"健康检查响应异常: {body[:300]}"
+          assert '"status":"ok"' in compact, f"健康检查未返回 ok: {body[:300]}"
+          print("健康检查响应:", body[:200].strip())
+          PY
+
+          # onefile 是自解压引导进程，实际服务是其子进程，一并清理
+          kill "$APP_PID" 2>/dev/null || true
+          pkill -f flymail-server 2>/dev/null || true
+          echo "冒烟测试通过：产物可启动并响应 /api/health"
 
       - name: 组装应用文件
         run: |
